@@ -6,15 +6,20 @@ Automated deployment of Warfork dedicated servers via GitHub Actions.
 
 ### Server prerequisites
 
-Each server needs to be a Linux box with SSH access. The `steam` user is assumed by default in `server-config.json`.
+Each server needs to be a Linux box with SSH access. The first-time setup is
+performed by `cli.py bootstrap`, which logs in as the `--root-user`
+(default `root`) — that account must be able to install packages, create the
+`wf` user, and chown `/app`.
 
-The `steam` user needs passwordless sudo to run the initial setup:
+After bootstrap, lifecycle commands run as the SSH user listed in
+`server-config.json` and drop to `wf` via `sudo -u wf …`, so that user must
+have passwordless `sudo` to `wf`:
 
 ```shell
-steam ALL=(ALL) NOPASSWD: /bin/bash /home/steam/scripts/Warfork.sh setup
+%wf-deploy ALL=(wf) NOPASSWD: ALL
 ```
 
-After that, everything the deploy workflow does (install, update, start, stop) runs as `steam` without sudo.
+(Or simply leave the SSH user as `root`, which the rest of the docs assume.)
 
 ### GitHub secrets
 
@@ -31,7 +36,9 @@ Passwords are passed to the server via `+set` at deploy time. They are never wri
 
 ### First deploy
 
-Run **Actions → Deploy Servers** with action `provision`. This installs system packages, downloads SteamCMD, installs the game, uploads configs, and starts all server processes in one go.
+Run **Actions → Bootstrap Servers** (or `cli.py bootstrap` locally) to install
+system packages, download SteamCMD, fetch the game files, and upload configs.
+Then run **Actions → Deploy Servers** to start the server processes.
 
 After the first deploy you can check that sessions are running:
 
@@ -46,7 +53,6 @@ Each server runs in a session named `wf-{port}`, e.g. `wf-44401`. Attach with `t
 ```shell
 server-management/
   server-config.json    Server registry — regions, ports, gametypes, hostnames
-  Warfork.sh            Uploaded to ~/scripts/ on each deploy
   configs/
     _base.cfg           Shared settings loaded by every server type
     clan-arena.cfg      Type-specific settings (execs _base.cfg then adds overrides)
@@ -55,6 +61,10 @@ server-management/
     instagib.cfg
     race.cfg
 ```
+
+All server-side logic (bootstrap, deploy, stop, status) lives in
+`wf_deploy/remote.py` and runs over SSH. Nothing is installed onto the host
+beyond the game files themselves.
 
 ## Config layering
 
@@ -82,31 +92,36 @@ Trigger **Actions → Deploy Servers** with:
 
 | Input | Options | Default |
 | ------- | --------- | --------- |
-| `steam_branch` | `beta`, `public` | `beta` |
 | `regions` | `US`, `EU`, or `all` | `all` |
 | `server_types` | `clan-arena`, `duel`, etc., or `all` | `all` |
-| `action` | `provision`, `update-and-restart`, `update-only`, `restart-only`, `stop`, `status` | `update-and-restart` |
 
-| Action | What it does |
-| -------- | -------------- |
-| `provision` | Full first-time setup: installs packages, SteamCMD, game, then starts servers |
-| `update-and-restart` | Stop → update via SteamCMD → start |
-| `update-only` | Update via SteamCMD without restarting |
-| `restart-only` | Restart without updating |
-| `stop` | Stop all matching sessions |
-| `status` | Report whether sessions are running |
+For each selected host, deploy stops the matching sessions, runs SteamCMD
+against the host's pinned Steam branch, uploads configs, then starts the
+sessions again.
+
+Full first-time setup (packages, SteamCMD, game files) is handled by the
+`bootstrap` command — see the **First deploy** section above. Use the
+separate `stop` and `status` commands for read-only or maintenance ops.
 
 ## Adding a server type
 
-Add an entry to `server_types` in `server-config.json`:
+Server types are now declared per-server under `servers.<region>.configuration`.
+Add a new key to the `configuration` block of every region that should host it:
 
 ```json
-"my-type": {
-  "label": "My Type",
-  "port": 44408,
-  "cvars": {
-    "sv_hostname": "[ WF Beta - ${REGION_LABEL} ] My Type",
-    "g_gametype": "mygametype"
+"US": {
+  "host": "...",
+  "label": "US East",
+  "steam_branch": "beta",
+  "configuration": {
+    "my-type": {
+      "label": "My Type",
+      "port": 44408,
+      "cvars": {
+        "sv_hostname": "[ WF Beta - ${REGION_LABEL} ] My Type",
+        "g_gametype": "mygametype"
+      }
+    }
   }
 }
 ```
@@ -119,27 +134,50 @@ set sv_defaultmap "wfmap1"
 set g_votable_gametypes "mygametype"
 ```
 
+If you only want this type in some regions, omit it from the others' `configuration`. `deploy -t my-type -r all` will silently skip regions that don't define it.
+
+`steam_branch` is set per host (under `servers.<region>`) and is consumed
+by `bootstrap`, which installs the game files for that branch into
+`/app/server`. SteamCMD installs one branch per `/app/server`, so every
+server type on a given host shares the same branch. Re-run `bootstrap` to
+switch a host between `beta` and `public`.
+
 ## Adding a region
 
-Regions are per-server entries, so subregions like `US-E`, `EU-DE`, `EU-FN`, `SG` each get their own block in `servers`:
+Regions are per-server entries, so subregions like `US-E`, `EU-DE`, `EU-FN`, `SG` each get their own block in `servers`. Each block carries its own `configuration`:
 
 ```json
 "EU-DE": {
   "host": "eu-de.warfork.com",
   "key_secret": "DO_SSH_PRIVATE_KEY_EU_DE",
   "username": "steam",
-  "label": "EU Frankfurt"
+  "label": "EU Frankfurt",
+  "steam_branch": "beta",
+  "configuration": {
+    "clan-arena": { "label": "Clan Arena", "port": 44401, "cvars": { "...": "..." } }
+  }
 }
 ```
 
-Add the corresponding SSH private key as a GitHub secret. The same `configs/` directory deploys to all of them.
+The same `configs/` directory on disk feeds every region, so just adding the
+region block (and its SSH key) is enough.
 
 ## Manual server commands
 
+Use the CLI from the repo root rather than running anything on the host:
+
 ```bash
-WF_PARAMS="..." STEAM_BRANCH=beta ~/scripts/Warfork.sh status
-WF_PARAMS="..." ~/scripts/Warfork.sh stop
-WF_PARAMS="..." ~/scripts/Warfork.sh restart
+pipenv run python cli.py status -r US -t clan-arena --ssh-key ~/.ssh/id_ed25519
+pipenv run python cli.py stop   -r US -t clan-arena --ssh-key ~/.ssh/id_ed25519
+pipenv run python cli.py deploy -r US -t clan-arena --ssh-key ~/.ssh/id_ed25519
+pipenv run python cli.py logs   -r US                --ssh-key ~/.ssh/id_ed25519
 ```
 
-Sessions are named by port (`wf-44401`, `wf-44402`, etc.) so multiple server types can run on the same machine without conflicting.
+If you do need to inspect a server directly, sessions are named by port
+(`wf-44401`, `wf-44402`, etc.) so multiple server types can run on the same
+machine without conflicting:
+
+```bash
+sudo -u wf tmux ls
+sudo -u wf tmux attach -t wf-44401
+```

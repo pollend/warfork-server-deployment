@@ -4,7 +4,6 @@ config.py – load and validate server-config.json into Python dataclasses.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,18 +14,20 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 @dataclass
+class ServerType:
+    label: str
+    port: int
+    cvars: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ServerEntry:
     host: str
     key_secret: str          # name of the env-var / secret (legacy field kept for reference)
     label: str
     username: str = "root"
-
-
-@dataclass
-class ServerType:
-    label: str
-    port: int
-    cvars: dict[str, Any] = field(default_factory=dict)
+    steam_branch: str | None = None  # per-host branch; falls back to CLI --branch
+    configuration: dict[str, ServerType] = field(default_factory=dict)
 
 
 @dataclass
@@ -38,7 +39,6 @@ class SteamBranch:
 class ServerConfig:
     servers: dict[str, ServerEntry]
     server_defaults: dict[str, Any]
-    server_types: dict[str, ServerType]
     steam_branches: dict[str, SteamBranch]
 
     # ------------------------------------------------------------------
@@ -49,12 +49,29 @@ class ServerConfig:
         return list(self.servers.keys())
 
     def type_keys(self) -> list[str]:
-        return list(self.server_types.keys())
+        """Union of all type keys defined across every server (preserving order)."""
+        seen: list[str] = []
+        for srv in self.servers.values():
+            for k in srv.configuration:
+                if k not in seen:
+                    seen.append(k)
+        return seen
 
 
 # ---------------------------------------------------------------------------
 # Loader
 # ---------------------------------------------------------------------------
+
+def _load_configuration(raw: dict[str, Any]) -> dict[str, ServerType]:
+    return {
+        k: ServerType(
+            label=v.get("label", k),
+            port=int(v["port"]),
+            cvars=v.get("cvars", {}),
+        )
+        for k, v in raw.items()
+    }
+
 
 def load(path: str | Path) -> ServerConfig:
     """Parse *path* and return a validated :class:`ServerConfig`."""
@@ -66,17 +83,10 @@ def load(path: str | Path) -> ServerConfig:
             key_secret=v.get("key_secret", ""),
             label=v.get("label", k),
             username=v.get("username", "root"),
+            steam_branch=v.get("steam_branch"),
+            configuration=_load_configuration(v.get("configuration", {})),
         )
         for k, v in raw.get("servers", {}).items()
-    }
-
-    server_types = {
-        k: ServerType(
-            label=v.get("label", k),
-            port=int(v["port"]),
-            cvars=v.get("cvars", {}),
-        )
-        for k, v in raw.get("server_types", {}).items()
     }
 
     steam_branches = {
@@ -87,6 +97,5 @@ def load(path: str | Path) -> ServerConfig:
     return ServerConfig(
         servers=servers,
         server_defaults=raw.get("server_defaults", {}),
-        server_types=server_types,
         steam_branches=steam_branches,
     )

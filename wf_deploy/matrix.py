@@ -25,7 +25,8 @@ class MatrixEntry:
     host: str
     username: str
     port: int
-    wf_params: str          # Full "+exec … +set …" command-line string
+    wf_params: str               # Full "+exec … +set …" command-line string
+    steam_branch: str | None     # Resolved branch (server's steam_branch or CLI fallback)
 
 
 @dataclass
@@ -35,6 +36,7 @@ class ServerMatrixEntry:
     region_label: str
     host: str
     username: str
+    steam_branch: str | None     # Resolved branch (server's steam_branch or CLI fallback)
 
 
 # ---------------------------------------------------------------------------
@@ -74,16 +76,28 @@ def build(
     config: ServerConfig,
     regions: str = "all",
     types: str = "all",
+    default_branch: str | None = None,
 ) -> tuple[list[MatrixEntry], list[ServerMatrixEntry]]:
     """
     Build the full deployment matrix.
+
+    Each server defines its own ``configuration`` block, so the set of valid
+    server-type keys is per-server. Type-key validation runs against the
+    *union* of every server's configuration; per-server we then intersect
+    with whatever that server actually defines (silently skipping requested
+    types it doesn't have).
 
     Returns:
         (entries, server_entries) where *entries* is the per-job matrix
         and *server_entries* is the per-host matrix.
     """
     region_keys = _resolve_keys(regions, config.region_keys(), "regions")
-    type_keys = _resolve_keys(types, config.type_keys(), "server types")
+
+    if types.strip().lower() == "all":
+        # Each server contributes whatever it has defined.
+        requested_types: list[str] | None = None
+    else:
+        requested_types = _resolve_keys(types, config.type_keys(), "server types")
 
     default_cvars: dict[str, Any] = config.server_defaults.get("cvars", {})
 
@@ -92,6 +106,7 @@ def build(
 
     for region in region_keys:
         srv = config.servers[region]
+        resolved_branch = srv.steam_branch or default_branch
 
         server_entries.append(
             ServerMatrixEntry(
@@ -99,11 +114,17 @@ def build(
                 region_label=srv.label,
                 host=srv.host,
                 username=srv.username,
+                steam_branch=resolved_branch,
             )
         )
 
-        for stype in type_keys:
-            st = config.server_types[stype]
+        if requested_types is None:
+            keys_for_server = list(srv.configuration.keys())
+        else:
+            keys_for_server = [k for k in requested_types if k in srv.configuration]
+
+        for stype in keys_for_server:
+            st = srv.configuration[stype]
 
             # Merge: defaults ← type cvars ← port
             merged: dict[str, Any] = {
@@ -126,6 +147,7 @@ def build(
                     username=srv.username,
                     port=st.port,
                     wf_params=wf_params,
+                    steam_branch=resolved_branch,
                 )
             )
 

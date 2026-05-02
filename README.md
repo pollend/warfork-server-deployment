@@ -4,8 +4,9 @@ This project manages Warfork dedicated servers over SSH.
 
 The main entrypoint is `cli.py`, which can:
 - Build and inspect a region/server-type deployment matrix
-- Provision or update remote hosts
-- Start, stop, restart, and check server status
+- Bootstrap a fresh host (one-time install of packages, SteamCMD, game files)
+- Deploy: update game files via SteamCMD, refresh configs, restart sessions
+- Stop and check status of running sessions
 
 ## Requirements
 
@@ -25,9 +26,8 @@ Python dependencies (declared in `requirements.txt`, managed via pipenv):
 - `cli.py`: Command-line entrypoint
 - `wf_deploy/config.py`: Loads `server-config.json`
 - `wf_deploy/matrix.py`: Builds region x server-type deployment jobs
-- `wf_deploy/remote.py`: SSH/SCP actions against remote hosts
+- `wf_deploy/remote.py`: SSH/SCP actions against remote hosts (bootstrap, lifecycle, log tailing — all logic lives here)
 - `server-management/server-config.json`: Server and game type definitions
-- `server-management/Warfork.sh`: Remote lifecycle script uploaded/executed on servers
 - `server-management/configs/*.cfg`: Warfork config files per game type
 
 ## Setup
@@ -71,9 +71,10 @@ By default the CLI uses:
 - Scripts directory: `server-management/`
 
 Important fields in `server-config.json`:
-- `servers`: Region key -> host + label + username
-- `server_defaults.cvars`: Baseline cvars for all servers
-- `server_types`: Server type key -> label + port + cvars
+- `servers`: Region key -> host + label + username + `steam_branch` + `configuration`
+- `servers.<region>.steam_branch`: Pin this host to `beta` or `public`. Required for any host that will be bootstrapped. SteamCMD installs one branch per `/app/server`, so the branch is per host, not per server type.
+- `servers.<region>.configuration`: Server type key -> label + port + cvars (each region declares its own set; types may differ region to region)
+- `server_defaults.cvars`: Baseline cvars merged into every job
 - `steam_branches`: Allowed branch names (for metadata)
 
 ## Authentication
@@ -92,9 +93,11 @@ You can put any of these in a project-local `.env` file; pipenv automatically lo
 
 Top-level commands:
 - `matrix`: Preview what region/type jobs will be targeted
-- `bootstrap`: Log in as root and prepare each host (creates `wf` user, fixes `/home/wf` ownership)
-- `deploy`: Perform provisioning/update/lifecycle actions
-- `status`: Shorthand for `deploy --action status`
+- `bootstrap`: Log in as root and fully install each host (wf user, packages, SteamCMD, game files, configs)
+- `deploy`: Stop sessions, update game files via SteamCMD, refresh configs, restart sessions
+- `stop`: Stop every selected tmux session
+- `status`: Report whether each selected session is running
+- `logs`: Tail `/home/wf/wf-*.log` from every selected host in one terminal
 
 General selectors shared by commands:
 - `--config, -c`: Path to config JSON
@@ -127,14 +130,20 @@ pipenv run python cli.py matrix --json
 
 ### 2) Bootstrap a fresh host
 
-Run this once on each new server, or any time you see permission errors like
-`ln: failed to create symbolic link '/home/wf/.steam/sdk64/linux64': Permission denied`.
-The command logs in as `root` (override with `--root-user`) and:
+Run this once on each new server (or any time you need to re-install or
+recover one). The command logs in as `root` (override with `--root-user`)
+and performs the full first-time setup in a single pass:
 
 - Creates the `wf` user with `/home/wf` as a real home directory
 - Removes any stale `/home/wf/.steam/sdk{32,64}` paths left as root-owned directories
-- Recursively chowns `/home/wf` to `wf:wf`
-- Ensures `/app/{Steam,server,scripts}` exist
+- Installs system packages and downloads SteamCMD
+- Installs the Warfork game files for the host's Steam branch
+- Uploads the local `configs/*.cfg` files into `/app/server/basewf/configs`
+- Recursively chowns `/home/wf` and `/app/{Steam,server}` to `wf:wf`
+
+The Steam branch comes from the host's `steam_branch` field in
+`server-config.json` (set under `servers.<region>`). SteamCMD installs
+one branch per `/app/server`, so the branch is pinned per host.
 
 ```bash
 pipenv run python cli.py bootstrap --ssh-key ~/.ssh/id_ed25519
@@ -146,15 +155,24 @@ Target specific hosts:
 pipenv run python cli.py bootstrap -r US,EU --ssh-key ~/.ssh/id_ed25519
 ```
 
-After bootstrap succeeds, run `deploy --action provision` to install SteamCMD
-and the game files.
+Bootstrap is idempotent — re-running it is the supported way to refresh
+game files or recover a misconfigured host. After it succeeds, use
+`deploy` to roll out updates.
 
-### 3) Deploy and manage servers
+### 3) Deploy
 
-Default action is `update-and-restart`:
+`deploy` always performs the same sequence per host: stop the matching
+sessions, run SteamCMD against the host's pinned Steam branch, upload
+configs, then start the sessions again. There is no action flag.
 
 ```bash
 pipenv run python cli.py deploy --ssh-key ~/.ssh/id_ed25519
+```
+
+Target a subset:
+
+```bash
+pipenv run python cli.py deploy -r US -t race --ssh-key ~/.ssh/id_ed25519
 ```
 
 Dry run (no SSH connections):
@@ -163,40 +181,76 @@ Dry run (no SSH connections):
 pipenv run python cli.py deploy --dry-run
 ```
 
-Provision selected targets:
+Higher parallelism:
 
 ```bash
 pipenv run python cli.py deploy \
-  --action provision \
-  --regions US \
-  --types clan-arena,duel \
-  --ssh-key ~/.ssh/id_ed25519
-```
-
-Use public branch and higher parallelism:
-
-```bash
-pipenv run python cli.py deploy \
-  --branch public \
   --parallel 8 \
   --ssh-key ~/.ssh/id_ed25519
 ```
 
+To switch a host to a different Steam branch, edit its `steam_branch` field
+in `server-config.json` and re-run `bootstrap` for that host.
+
+#### Testing a local game build
+
+Pass `--local-build PATH` to `bootstrap` or `deploy` to skip SteamCMD and
+rsync the contents of a local build directory onto each host instead. Useful
+when you have an unpublished build you want to try out without going through
+a Steam branch.
+
+```bash
+pipenv run python cli.py deploy \
+  --local-build ~/projects/warfork-qfusion/source/build/warfork-qfusion \
+  --ssh-key ~/.ssh/id_ed25519
+```
+
+The directory's contents (not the directory itself) are rsynced into
+`/app/server`, then the SSH user runs `sudo chown -R wf:wf /app/server`. The
+host's `steam_branch` is ignored when `--local-build` is set, so it doesn't
+need to be defined for local-build runs. Re-run without `--local-build` (or
+re-run `bootstrap`) to switch back to a Steam branch.
+
 Deploy options:
-- `--action, -a`: `provision`, `update-and-restart`, `update-only`, `restart-only`, `stop`, `status`
-- `--branch, -b`: `beta` or `public`
-- `--scripts-dir`: local path to folder containing `Warfork.sh` and `configs/`
+- `--scripts-dir`: local path to folder containing `configs/`
 - `--parallel, -p`: max concurrent SSH connections (1-16)
 - `--rcon-password`: override or pass directly
 - `--operator-password`: override or pass directly
+- `--local-build`: rsync game files from a local build directory instead of SteamCMD
 - `--dry-run`: print actions without remote execution
 
-### 4) Status shorthand
+### 4) Tail logs from every host
 
-Equivalent to running `deploy --action status`:
+Stream `/home/wf/wf-*.log` from each selected host into one terminal, with
+each line color-coded and prefixed with the region label. Ctrl+C to stop.
+
+```bash
+pipenv run python cli.py logs --ssh-key ~/.ssh/id_ed25519
+```
+
+Limit to a subset and show more history:
+
+```bash
+pipenv run python cli.py logs -r US,EU -n 500 --ssh-key ~/.ssh/id_ed25519
+```
+
+The remote `tail -F` runs under `sudo` because the log files are owned by
+`wf`. Pass `--no-sudo` if your SSH user can already read them.
+
+### 5) Status
+
+Report whether each selected tmux session is currently running:
 
 ```bash
 pipenv run python cli.py status --ssh-key ~/.ssh/id_ed25519
+```
+
+### 6) Stop
+
+Stop every selected tmux session (no-op for sessions that aren't running):
+
+```bash
+pipenv run python cli.py stop -r EU --ssh-key ~/.ssh/id_ed25519
 ```
 
 ## Typical Workflows
@@ -214,14 +268,13 @@ Roll out one game type to one region:
 pipenv run python cli.py deploy \
   -r US \
   -t race \
-  -a update-and-restart \
   --ssh-key ~/.ssh/id_ed25519
 ```
 
 Stop all servers in EU:
 
 ```bash
-pipenv run python cli.py deploy -r EU -a stop --ssh-key ~/.ssh/id_ed25519
+pipenv run python cli.py stop -r EU --ssh-key ~/.ssh/id_ed25519
 ```
 
 ## Exit Behavior
@@ -243,7 +296,7 @@ pipenv run python cli.py deploy -r EU -a stop --ssh-key ~/.ssh/id_ed25519
 - Unknown region/server type:
   - Check keys in `server-management/server-config.json` and pass exact names.
 - Remote command failed:
-  - Verify host reachability, key permissions, remote user privileges, and that `/app/scripts/Warfork.sh` exists after setup.
+  - Verify host reachability, key permissions, and remote user privileges. The CLI runs all server-side logic over SSH — there is no longer a `Warfork.sh` to install on the host; the only on-disk remote artifacts are the game files under `/app/server`, the SteamCMD install under `/app/Steam`, and the per-instance launcher script `/home/wf/wf-<port>.sh` written each time `start` runs.
 
 ## Related Docs
 

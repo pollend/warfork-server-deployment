@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -35,7 +37,27 @@ from wf_deploy import remote
 
 DEFAULT_CONFIG = Path(__file__).parent / "server-management" / "server-config.json"
 DEFAULT_SCRIPTS_DIR = Path(__file__).parent / "server-management"
-VALID_ACTIONS = ("provision", "update-and-restart", "update-only", "restart-only", "stop", "status")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_host_branches(server_entries) -> dict[str, str]:
+    """Map host -> Steam branch. Every server must declare steam_branch.
+
+    SteamCMD installs one branch per /app/server, so the branch is pinned
+    per host (per server entry in the config).
+    """
+    host_branch: dict[str, str] = {}
+    for se in server_entries:
+        if not se.steam_branch:
+            raise click.ClickException(
+                f"Server {se.region} ({se.region_label}) has no steam_branch. "
+                f"Set steam_branch under servers.{se.region}."
+            )
+        host_branch[se.host] = se.steam_branch
+    return host_branch
 
 
 # ---------------------------------------------------------------------------
@@ -96,13 +118,21 @@ def cli():
 
 @cli.command("matrix")
 @_common_options
+@click.option(
+    "--branch", "-b",
+    default=None,
+    type=click.Choice(["beta", "public"], case_sensitive=False),
+    help="Fallback Steam branch shown for entries that don't pin one.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON instead of a table.")
-def cmd_matrix(config, regions, types, as_json):
+def cmd_matrix(config, regions, types, branch, as_json):
     """Print the deployment matrix that would be used by `deploy`."""
     server_config = cfg_mod.load(config)
 
     try:
-        entries, server_entries = matrix_mod.build(server_config, regions, types)
+        entries, server_entries = matrix_mod.build(
+            server_config, regions, types, default_branch=branch,
+        )
     except ValueError as exc:
         raise click.ClickException(str(exc))
 
@@ -114,11 +144,15 @@ def cmd_matrix(config, regions, types, as_json):
         click.echo(json.dumps(data, indent=2))
         return
 
-    click.echo(f"\n{'Region':<12}  {'Type':<16}  {'Host':<20}  {'Port':<6}  WF Params (truncated)")
-    click.echo("-" * 90)
+    click.echo(f"\n{'Region':<12}  {'Type':<16}  {'Host':<20}  {'Port':<6}  {'Branch':<8}  WF Params (truncated)")
+    click.echo("-" * 100)
     for e in entries:
         params_preview = e.wf_params[:40] + ("…" if len(e.wf_params) > 40 else "")
-        click.echo(f"{e.region_label:<12}  {e.type_label:<16}  {e.host:<20}  {e.port:<6}  {params_preview}")
+        branch_str = e.steam_branch or "—"
+        click.echo(
+            f"{e.region_label:<12}  {e.type_label:<16}  {e.host:<20}  {e.port:<6}  "
+            f"{branch_str:<8}  {params_preview}"
+        )
     click.echo(f"\n{len(entries)} job(s) across {len(server_entries)} server(s).")
 
 
@@ -130,25 +164,11 @@ def cmd_matrix(config, regions, types, as_json):
 @_common_options
 @_ssh_key_option
 @click.option(
-    "--action", "-a",
-    default="update-and-restart",
-    show_default=True,
-    type=click.Choice(VALID_ACTIONS, case_sensitive=False),
-    help="Action to perform on matched servers.",
-)
-@click.option(
-    "--branch", "-b",
-    default="beta",
-    show_default=True,
-    type=click.Choice(["beta", "public"], case_sensitive=False),
-    help="Steam branch to deploy.",
-)
-@click.option(
     "--scripts-dir",
     default=str(DEFAULT_SCRIPTS_DIR),
     show_default=True,
     type=click.Path(exists=True, file_okay=False),
-    help="Local path to the server-management/ folder (contains Warfork.sh + configs/).",
+    help="Local path to the server-management/ folder (contains configs/).",
 )
 @click.option(
     "--parallel", "-p",
@@ -170,15 +190,31 @@ def cmd_matrix(config, regions, types, as_json):
     help="g_operator_password injected into server params.",
 )
 @click.option(
+    "--local-build",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, resolve_path=True),
+    help=(
+        "Local game build directory to rsync onto each host (replaces SteamCMD). "
+        "Useful for testing a local build without publishing it to a Steam branch."
+    ),
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     help="Print what would happen without connecting to any server.",
 )
 def cmd_deploy(
-    config, regions, types, ssh_key, action, branch,
-    scripts_dir, parallel, rcon_password, operator_password, dry_run,
+    config, regions, types, ssh_key,
+    scripts_dir, parallel, rcon_password, operator_password, local_build, dry_run,
 ):
-    """Deploy, update, restart, stop, or check status of game servers."""
+    """Update game files via SteamCMD, refresh configs, and restart all
+    selected server processes.
+
+    For each host: stop the matching tmux sessions, run SteamCMD against the
+    host's pinned Steam branch, upload configs, then start the sessions
+    again. Use `bootstrap` for first-time host setup; use `stop` / `status`
+    for read-only or maintenance operations.
+    """
 
     if not ssh_key and not dry_run:
         raise click.ClickException(
@@ -192,80 +228,99 @@ def cmd_deploy(
     except ValueError as exc:
         raise click.ClickException(str(exc))
 
+    local_build_path = Path(local_build) if local_build else None
+    host_branch = (
+        {se.host: None for se in server_entries}
+        if local_build_path else
+        _resolve_host_branches(server_entries)
+    )
     scripts_path = Path(scripts_dir)
-    action = action.lower()
+    source_label = (
+        f"local build {local_build_path}" if local_build_path else "Steam branch (per host)"
+    )
 
     # ── Summary ──────────────────────────────────────────────────────────
     click.echo(f"\n{'='*60}")
-    click.echo(f"  Action  : {action}")
-    click.echo(f"  Branch  : {branch}")
+    click.echo(f"  Action  : update + restart")
     click.echo(f"  Regions : {regions}")
     click.echo(f"  Types   : {types}")
+    click.echo(f"  Source  : {source_label}")
     click.echo(f"  Jobs    : {len(entries)} across {len(server_entries)} server(s)")
     click.echo(f"  Dry run : {dry_run}")
     click.echo(f"{'='*60}\n")
 
     if dry_run:
         for e in entries:
-            click.echo(f"  [DRY-RUN] {e.region_label} / {e.type_label} @ {e.host}:{e.port}")
+            src = "local-build" if local_build_path else f"branch={e.steam_branch}"
+            click.echo(
+                f"  [DRY-RUN] {e.region_label} / {e.type_label} "
+                f"@ {e.host}:{e.port}  {src}"
+            )
             click.echo(f"            {e.wf_params[:80]}")
         return
 
-    # ── Phase 1: per-host setup (upload scripts + provision) ─────────────
-    if action in ("provision", "update-and-restart", "update-only"):
-        click.echo("Phase 1/2 — uploading scripts to servers …\n")
-        seen_hosts: set[str] = set()
+    # ── Phase 1: per-host (parallel across hosts; sequential within) ─────
+    # Kill all wf-* sessions on the host, run SteamCMD update, upload configs.
+    # Killing every session (not just the selected ones) frees RAM/CPU on
+    # small hosts and prevents the running binary from locking files that
+    # SteamCMD is trying to overwrite.
+    click.echo("Phase 1/2 — stopping sessions, updating game files, uploading configs …\n")
 
-        def _setup(se):
-            if se.host in seen_hosts:
-                return
-            seen_hosts.add(se.host)
-            click.echo(f"  [{se.region_label}] Setting up {se.host} …")
-            remote.setup_server(
-                host=se.host,
-                username=se.username,
-                ssh_key=ssh_key,
-                scripts_dir=scripts_path,
-                action=action,
-            )
-            click.echo(f"  [{se.region_label}] Setup complete ✓")
+    def _prepare_host(se):
+        click.echo(f"  [{se.region_label}] Stopping all sessions on {se.host} …")
+        remote.stop_all_instances(
+            host=se.host,
+            username=se.username,
+            ssh_key=ssh_key,
+        )
+        remote.update_and_upload(
+            host=se.host,
+            username=se.username,
+            ssh_key=ssh_key,
+            scripts_dir=scripts_path,
+            steam_branch=host_branch[se.host],
+            local_build=local_build_path,
+        )
+        click.echo(f"  [{se.region_label}] Host ready ✓")
 
-        with ThreadPoolExecutor(max_workers=parallel) as pool:
-            futures = {pool.submit(_setup, se): se for se in server_entries}
-            for fut in as_completed(futures):
-                se = futures[fut]
-                exc = fut.exception()
-                if exc:
-                    click.echo(
-                        click.style(f"  [{se.region_label}] SETUP FAILED: {exc}", fg="red"),
-                        err=True,
-                    )
+    setup_failures: set[str] = set()
+    with ThreadPoolExecutor(max_workers=parallel) as pool:
+        futures = {pool.submit(_prepare_host, se): se for se in server_entries}
+        for fut in as_completed(futures):
+            se = futures[fut]
+            exc = fut.exception()
+            if exc:
+                setup_failures.add(se.host)
+                click.echo(
+                    click.style(f"  [{se.region_label}] SETUP FAILED: {exc}", fg="red"),
+                    err=True,
+                )
 
-    # ── Phase 2: per-instance action ─────────────────────────────────────
-    step = "2/2" if action in ("provision", "update-and-restart", "update-only") else "1/1"
-    click.echo(f"\nPhase {step} — running '{action}' on {len(entries)} instance(s) …\n")
+    # ── Phase 2: per-instance start ─────────────────────────────────────
+    click.echo(f"\nPhase 2/2 — starting {len(entries)} instance(s) …\n")
 
     failures: list[str] = []
 
-    def _deploy(entry):
+    def _start(entry):
         label = f"{entry.region_label} / {entry.type_label}"
+        if entry.host in setup_failures:
+            raise RuntimeError(f"skipping start; host {entry.host} setup failed")
+        wf_params = remote.resolve_wf_params(
+            entry.wf_params, entry.region_label,
+            rcon_password=rcon_password,
+            operator_password=operator_password,
+        )
         click.echo(f"  [{label}] Starting …")
-        remote.run_action(
+        remote.start_instance(
             host=entry.host,
             username=entry.username,
             ssh_key=ssh_key,
-            server_type=entry.server_type,
-            wf_params=entry.wf_params,
-            region_label=entry.region_label,
-            action=action,
-            steam_branch=branch,
-            rcon_password=rcon_password,
-            operator_password=operator_password,
+            wf_params=wf_params,
         )
         click.echo(f"  [{label}] Done ✓")
 
     with ThreadPoolExecutor(max_workers=parallel) as pool:
-        futures = {pool.submit(_deploy, e): e for e in entries}
+        futures = {pool.submit(_start, e): e for e in entries}
         for fut in as_completed(futures):
             e = futures[fut]
             label = f"{e.region_label} / {e.type_label}"
@@ -305,19 +360,38 @@ def cmd_deploy(
     help="Privileged SSH user used to prepare the host (must be able to useradd/chown).",
 )
 @click.option(
+    "--scripts-dir",
+    default=str(DEFAULT_SCRIPTS_DIR),
+    show_default=True,
+    type=click.Path(exists=True, file_okay=False),
+    help="Local path to the server-management/ folder (contains configs/).",
+)
+@click.option(
     "--parallel", "-p",
     default=4,
     show_default=True,
     type=click.IntRange(1, 16),
     help="Maximum concurrent SSH connections.",
 )
-def cmd_bootstrap(config, regions, types, ssh_key, root_user, parallel):
-    """Log in as root and prepare each host's wf user + filesystem layout.
+@click.option(
+    "--local-build",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, resolve_path=True),
+    help=(
+        "Local game build directory to rsync onto each host (replaces SteamCMD). "
+        "Useful for testing a local build without publishing it to a Steam branch."
+    ),
+)
+def cmd_bootstrap(
+    config, regions, types, ssh_key, root_user, scripts_dir, parallel, local_build,
+):
+    """Log in as root and perform full first-time setup for each host.
 
-    Use this once per host (or to recover from a misconfigured run that left
-    /home/wf/.steam/sdk64 as a root-owned directory). Subsequent
-    `deploy --action provision/update-and-restart` calls run as the regular
-    server user.
+    Creates the wf user, installs system packages, downloads SteamCMD, fetches
+    the game files for the host's Steam branch, uploads configs, and chowns
+    everything to wf:wf. Idempotent — safe to re-run to recover or refresh.
+
+    Subsequent `deploy` calls run as the regular SSH user.
     """
     if not ssh_key:
         raise click.ClickException(
@@ -327,22 +401,39 @@ def cmd_bootstrap(config, regions, types, ssh_key, root_user, parallel):
     server_config = cfg_mod.load(config)
 
     try:
-        _, server_entries = matrix_mod.build(server_config, regions, types)
+        entries, server_entries = matrix_mod.build(server_config, regions, types)
     except ValueError as exc:
         raise click.ClickException(str(exc))
 
+    local_build_path = Path(local_build) if local_build else None
+    host_branch = (
+        {se.host: None for se in server_entries}
+        if local_build_path else
+        _resolve_host_branches(server_entries)
+    )
+    scripts_path = Path(scripts_dir)
+
+    source_label = (
+        f"local build {local_build_path}" if local_build_path else "Steam branch (per host)"
+    )
     click.echo(f"\n{'='*60}")
     click.echo(f"  Bootstrapping {len(server_entries)} host(s) as {root_user!r}")
+    click.echo(f"  Source : {source_label}")
     click.echo(f"{'='*60}\n")
 
     failures: list[str] = []
 
     def _bootstrap(se):
-        click.echo(f"  [{se.region_label}] Preparing {se.host} …")
+        branch = host_branch[se.host]
+        src = "local build" if local_build_path else f"branch={branch}"
+        click.echo(f"  [{se.region_label}] Preparing {se.host} ({src}) …")
         remote.bootstrap_host(
             host=se.host,
             username=root_user,
             ssh_key=ssh_key,
+            scripts_dir=scripts_path,
+            steam_branch=branch,
+            local_build=local_build_path,
         )
         click.echo(f"  [{se.region_label}] Ready ✓")
 
@@ -372,28 +463,180 @@ def cmd_bootstrap(config, regions, types, ssh_key, root_user, parallel):
 
 
 # ---------------------------------------------------------------------------
-# status shorthand
+# logs command
+# ---------------------------------------------------------------------------
+
+_LOG_PALETTE = ("green", "cyan", "yellow", "magenta", "blue", "red", "bright_green", "bright_cyan")
+
+
+@cli.command("logs")
+@_common_options
+@_ssh_key_option
+@click.option(
+    "--lines", "-n",
+    default=100,
+    show_default=True,
+    type=click.IntRange(0, 100000),
+    help="Lines of history to show before tailing.",
+)
+@click.option(
+    "--no-sudo",
+    is_flag=True,
+    help="Don't prefix the remote tail with sudo (logs must be readable by the SSH user).",
+)
+def cmd_logs(config, regions, types, ssh_key, lines, no_sudo):
+    """Tail /home/wf/wf-*.log on every selected host (Ctrl+C to stop).
+
+    Opens one SSH session per host (deduplicated across server types) and
+    streams each line prefixed with the region label. Logs are owned by the
+    `wf` user, so the remote command runs under sudo unless --no-sudo is set.
+    """
+    if not ssh_key:
+        raise click.ClickException(
+            "SSH private key is required. Use --ssh-key or set $WF_SSH_KEY."
+        )
+
+    server_config = cfg_mod.load(config)
+
+    try:
+        _, server_entries = matrix_mod.build(server_config, regions, types)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+
+    click.echo(f"Tailing logs from {len(server_entries)} host(s). Ctrl+C to stop.\n")
+
+    threads: list[threading.Thread] = []
+    for i, se in enumerate(server_entries):
+        color = _LOG_PALETTE[i % len(_LOG_PALETTE)]
+        prefix = click.style(f"[{se.region_label}]", fg=color)
+
+        t = threading.Thread(
+            target=remote.stream_logs,
+            kwargs=dict(
+                host=se.host,
+                username=se.username,
+                ssh_key=ssh_key,
+                prefix=prefix,
+                lines=lines,
+                use_sudo=not no_sudo,
+            ),
+            daemon=True,
+            name=f"tail-{se.region}",
+        )
+        t.start()
+        threads.append(t)
+
+    try:
+        while any(t.is_alive() for t in threads):
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        click.echo("\nStopping log tail …", err=True)
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle helpers shared by status / stop
+# ---------------------------------------------------------------------------
+
+def _run_per_instance(entries, ssh_key, parallel, label_verb, fn):
+    """Apply *fn(entry, wf_params)* to each entry in parallel and report."""
+    failures: list[str] = []
+
+    def _wrap(entry):
+        label = f"{entry.region_label} / {entry.type_label}"
+        wf_params = remote.resolve_wf_params(entry.wf_params, entry.region_label)
+        click.echo(f"  [{label}] {label_verb} …")
+        fn(entry, wf_params)
+
+    with ThreadPoolExecutor(max_workers=parallel) as pool:
+        futures = {pool.submit(_wrap, e): e for e in entries}
+        for fut in as_completed(futures):
+            e = futures[fut]
+            label = f"{e.region_label} / {e.type_label}"
+            exc = fut.exception()
+            if exc:
+                failures.append(label)
+                click.echo(
+                    click.style(f"  [{label}] FAILED: {exc}", fg="red"),
+                    err=True,
+                )
+
+    if failures:
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# status command
 # ---------------------------------------------------------------------------
 
 @cli.command("status")
 @_common_options
 @_ssh_key_option
-@click.pass_context
-def cmd_status(ctx, config, regions, types, ssh_key):
-    """Shorthand for `deploy --action status`."""
-    ctx.invoke(
-        cmd_deploy,
-        config=config,
-        regions=regions,
-        types=types,
-        ssh_key=ssh_key,
-        action="status",
-        branch="beta",
-        scripts_dir=str(DEFAULT_SCRIPTS_DIR),
-        parallel=4,
-        rcon_password="",
-        operator_password="",
-        dry_run=False,
+@click.option(
+    "--parallel", "-p",
+    default=4,
+    show_default=True,
+    type=click.IntRange(1, 16),
+    help="Maximum concurrent SSH connections.",
+)
+def cmd_status(config, regions, types, ssh_key, parallel):
+    """Report whether each selected tmux session is currently running."""
+    if not ssh_key:
+        raise click.ClickException(
+            "SSH private key is required. Use --ssh-key or set $WF_SSH_KEY."
+        )
+
+    server_config = cfg_mod.load(config)
+    try:
+        entries, _ = matrix_mod.build(server_config, regions, types)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+
+    _run_per_instance(
+        entries, ssh_key, parallel, "Checking",
+        lambda entry, wf_params: remote.status_instance(
+            host=entry.host,
+            username=entry.username,
+            ssh_key=ssh_key,
+            wf_params=wf_params,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# stop command
+# ---------------------------------------------------------------------------
+
+@cli.command("stop")
+@_common_options
+@_ssh_key_option
+@click.option(
+    "--parallel", "-p",
+    default=4,
+    show_default=True,
+    type=click.IntRange(1, 16),
+    help="Maximum concurrent SSH connections.",
+)
+def cmd_stop(config, regions, types, ssh_key, parallel):
+    """Stop every selected tmux session (no-op if not running)."""
+    if not ssh_key:
+        raise click.ClickException(
+            "SSH private key is required. Use --ssh-key or set $WF_SSH_KEY."
+        )
+
+    server_config = cfg_mod.load(config)
+    try:
+        entries, _ = matrix_mod.build(server_config, regions, types)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+
+    _run_per_instance(
+        entries, ssh_key, parallel, "Stopping",
+        lambda entry, wf_params: remote.stop_instance(
+            host=entry.host,
+            username=entry.username,
+            ssh_key=ssh_key,
+            wf_params=wf_params,
+        ),
     )
 
 
