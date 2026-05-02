@@ -292,6 +292,86 @@ def cmd_deploy(
 
 
 # ---------------------------------------------------------------------------
+# bootstrap command
+# ---------------------------------------------------------------------------
+
+@cli.command("bootstrap")
+@_common_options
+@_ssh_key_option
+@click.option(
+    "--root-user", "-u",
+    default="root",
+    show_default=True,
+    help="Privileged SSH user used to prepare the host (must be able to useradd/chown).",
+)
+@click.option(
+    "--parallel", "-p",
+    default=4,
+    show_default=True,
+    type=click.IntRange(1, 16),
+    help="Maximum concurrent SSH connections.",
+)
+def cmd_bootstrap(config, regions, types, ssh_key, root_user, parallel):
+    """Log in as root and prepare each host's wf user + filesystem layout.
+
+    Use this once per host (or to recover from a misconfigured run that left
+    /home/wf/.steam/sdk64 as a root-owned directory). Subsequent
+    `deploy --action provision/update-and-restart` calls run as the regular
+    server user.
+    """
+    if not ssh_key:
+        raise click.ClickException(
+            "SSH private key is required. Use --ssh-key or set $WF_SSH_KEY."
+        )
+
+    server_config = cfg_mod.load(config)
+
+    try:
+        _, server_entries = matrix_mod.build(server_config, regions, types)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+
+    click.echo(f"\n{'='*60}")
+    click.echo(f"  Bootstrapping {len(server_entries)} host(s) as {root_user!r}")
+    click.echo(f"{'='*60}\n")
+
+    failures: list[str] = []
+
+    def _bootstrap(se):
+        click.echo(f"  [{se.region_label}] Preparing {se.host} …")
+        remote.bootstrap_host(
+            host=se.host,
+            username=root_user,
+            ssh_key=ssh_key,
+        )
+        click.echo(f"  [{se.region_label}] Ready ✓")
+
+    with ThreadPoolExecutor(max_workers=parallel) as pool:
+        futures = {pool.submit(_bootstrap, se): se for se in server_entries}
+        for fut in as_completed(futures):
+            se = futures[fut]
+            exc = fut.exception()
+            if exc:
+                failures.append(se.region_label)
+                click.echo(
+                    click.style(f"  [{se.region_label}] BOOTSTRAP FAILED: {exc}", fg="red"),
+                    err=True,
+                )
+
+    click.echo(f"\n{'='*60}")
+    ok = len(server_entries) - len(failures)
+    click.echo(f"  {ok}/{len(server_entries)} host(s) bootstrapped")
+    if failures:
+        click.echo(click.style("  Failed:", fg="red"))
+        for f in failures:
+            click.echo(click.style(f"    • {f}", fg="red"))
+        sys.exit(1)
+    else:
+        click.echo(click.style("  All done ✓", fg="green"))
+    click.echo(f"{'='*60}\n")
+
+
+# ---------------------------------------------------------------------------
 # status shorthand
 # ---------------------------------------------------------------------------
 

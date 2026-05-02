@@ -11,10 +11,11 @@ The main entrypoint is `cli.py`, which can:
 
 - Linux or macOS shell environment
 - Python 3.10+ (3.11+ recommended)
+- [pipenv](https://pipenv.pypa.io/) for environment and dependency management
 - SSH access to all target servers
 - A valid SSH private key file for remote login
 
-Python dependencies (from `requirements.txt`):
+Python dependencies (declared in `requirements.txt`, managed via pipenv):
 - `click`
 - `paramiko`
 - `scp`
@@ -31,16 +32,37 @@ Python dependencies (from `requirements.txt`):
 
 ## Setup
 
-From the repository root:
+Install pipenv if you don't already have it:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+python3 -m pip install --user pipenv
 ```
 
-If you see `ModuleNotFoundError: No module named 'scp'`, the virtual environment is missing dependencies. Re-run `pip install -r requirements.txt`.
+From the repository root, create the virtual environment and install dependencies from `requirements.txt`:
+
+```bash
+pipenv install -r requirements.txt
+```
+
+This creates a `Pipfile` (and `Pipfile.lock`) and a managed virtualenv. On subsequent setups, just run:
+
+```bash
+pipenv install
+```
+
+To enter the project shell:
+
+```bash
+pipenv shell
+```
+
+Or run individual commands without activating a shell:
+
+```bash
+pipenv run python cli.py matrix
+```
+
+If you see `ModuleNotFoundError: No module named 'scp'`, the virtual environment is missing dependencies. Re-run `pipenv install`.
 
 ## Configuration
 
@@ -64,10 +86,13 @@ Optional environment variables used by `deploy`:
 - `RCON_PASSWORD`: Injected as `+set rcon_password`
 - `OPERATOR_PASSWORD`: Injected as `+set g_operator_password`
 
+You can put any of these in a project-local `.env` file; pipenv automatically loads it for `pipenv run` and `pipenv shell`.
+
 ## CLI Overview
 
 Top-level commands:
 - `matrix`: Preview what region/type jobs will be targeted
+- `bootstrap`: Log in as root and prepare each host (creates `wf` user, fixes `/home/wf` ownership)
 - `deploy`: Perform provisioning/update/lifecycle actions
 - `status`: Shorthand for `deploy --action status`
 
@@ -78,44 +103,70 @@ General selectors shared by commands:
 
 ## Command Usage
 
+All commands below assume you are using `pipenv run`. If you've activated the env via `pipenv shell`, drop the `pipenv run` prefix.
+
 ### 1) Preview matrix
 
 Show all jobs in table format:
 
 ```bash
-python cli.py matrix
+pipenv run python cli.py matrix
 ```
 
 Only selected regions/types:
 
 ```bash
-python cli.py matrix -r US,EU -t clan-arena,duel
+pipenv run python cli.py matrix -r US,EU -t clan-arena,duel
 ```
 
 JSON output:
 
 ```bash
-python cli.py matrix --json
+pipenv run python cli.py matrix --json
 ```
 
-### 2) Deploy and manage servers
+### 2) Bootstrap a fresh host
+
+Run this once on each new server, or any time you see permission errors like
+`ln: failed to create symbolic link '/home/wf/.steam/sdk64/linux64': Permission denied`.
+The command logs in as `root` (override with `--root-user`) and:
+
+- Creates the `wf` user with `/home/wf` as a real home directory
+- Removes any stale `/home/wf/.steam/sdk{32,64}` paths left as root-owned directories
+- Recursively chowns `/home/wf` to `wf:wf`
+- Ensures `/app/{Steam,server,scripts}` exist
+
+```bash
+pipenv run python cli.py bootstrap --ssh-key ~/.ssh/id_ed25519
+```
+
+Target specific hosts:
+
+```bash
+pipenv run python cli.py bootstrap -r US,EU --ssh-key ~/.ssh/id_ed25519
+```
+
+After bootstrap succeeds, run `deploy --action provision` to install SteamCMD
+and the game files.
+
+### 3) Deploy and manage servers
 
 Default action is `update-and-restart`:
 
 ```bash
-python cli.py deploy --ssh-key ~/.ssh/id_ed25519
+pipenv run python cli.py deploy --ssh-key ~/.ssh/id_ed25519
 ```
 
 Dry run (no SSH connections):
 
 ```bash
-python cli.py deploy --dry-run
+pipenv run python cli.py deploy --dry-run
 ```
 
 Provision selected targets:
 
 ```bash
-python cli.py deploy \
+pipenv run python cli.py deploy \
   --action provision \
   --regions US \
   --types clan-arena,duel \
@@ -125,7 +176,7 @@ python cli.py deploy \
 Use public branch and higher parallelism:
 
 ```bash
-python cli.py deploy \
+pipenv run python cli.py deploy \
   --branch public \
   --parallel 8 \
   --ssh-key ~/.ssh/id_ed25519
@@ -140,12 +191,12 @@ Deploy options:
 - `--operator-password`: override or pass directly
 - `--dry-run`: print actions without remote execution
 
-### 3) Status shorthand
+### 4) Status shorthand
 
 Equivalent to running `deploy --action status`:
 
 ```bash
-python cli.py status --ssh-key ~/.ssh/id_ed25519
+pipenv run python cli.py status --ssh-key ~/.ssh/id_ed25519
 ```
 
 ## Typical Workflows
@@ -153,14 +204,14 @@ python cli.py status --ssh-key ~/.ssh/id_ed25519
 Preview before deploy:
 
 ```bash
-python cli.py matrix -r all -t all
-python cli.py deploy --dry-run -r all -t all
+pipenv run python cli.py matrix -r all -t all
+pipenv run python cli.py deploy --dry-run -r all -t all
 ```
 
 Roll out one game type to one region:
 
 ```bash
-python cli.py deploy \
+pipenv run python cli.py deploy \
   -r US \
   -t race \
   -a update-and-restart \
@@ -170,7 +221,7 @@ python cli.py deploy \
 Stop all servers in EU:
 
 ```bash
-python cli.py deploy -r EU -a stop --ssh-key ~/.ssh/id_ed25519
+pipenv run python cli.py deploy -r EU -a stop --ssh-key ~/.ssh/id_ed25519
 ```
 
 ## Exit Behavior
@@ -182,9 +233,13 @@ python cli.py deploy -r EU -a stop --ssh-key ~/.ssh/id_ed25519
 ## Troubleshooting
 
 - `ModuleNotFoundError` for `click`, `paramiko`, or `scp`:
-  - Activate the correct virtual environment and run `pip install -r requirements.txt`.
+  - Run `pipenv install` from the repo root, then prefix commands with `pipenv run` (or use `pipenv shell`).
+- `pipenv: command not found`:
+  - Install with `python3 -m pip install --user pipenv` and ensure `~/.local/bin` is on your `PATH`.
+- Wrong Python version picked up:
+  - Force a specific interpreter with `pipenv --python 3.11 install -r requirements.txt`.
 - `SSH private key is required`:
-  - Pass `--ssh-key` or set `WF_SSH_KEY`.
+  - Pass `--ssh-key` or set `WF_SSH_KEY` (a `.env` file in the repo root works with pipenv).
 - Unknown region/server type:
   - Check keys in `server-management/server-config.json` and pass exact names.
 - Remote command failed:

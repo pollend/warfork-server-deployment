@@ -82,6 +82,57 @@ def upload_directory(host: str, username: str, ssh_key: str,
 
 
 # ---------------------------------------------------------------------------
+# Bootstrap step  (logs in as root, fixes per-host environment)
+# ---------------------------------------------------------------------------
+
+def bootstrap_host(
+    host: str,
+    username: str,
+    ssh_key: str,
+) -> None:
+    """
+    Prepare a freshly-imaged host so that `wf` can run the game server.
+
+    Runs as *username* (typically root) and:
+      - Creates the `wf` system user with /home/wf as a real home dir.
+      - Removes any stale /home/wf/.steam/sdk{32,64} paths that exist as
+        directories rather than symlinks (root-owned leftovers from earlier
+        misconfigured runs cause `ln -sf` to fail with EACCES).
+      - Recursively chowns /home/wf to wf:wf.
+      - Ensures /app/{Steam,server,scripts} exist so later phases can write.
+      - If /app/Steam or /app/server already exist (e.g. provision has run as
+        root), recursively chowns them to wf:wf so that `wf` can traverse the
+        SteamCMD `linux32`/`linux64` symlinks at runtime. Safe to re-run after
+        every provision.
+    """
+    print(f"\n[{host}] Bootstrapping host as {username} …")
+    client = _connect(host, username, ssh_key)
+    try:
+        cmd = (
+            "set -e; "
+            # Create wf user with a proper home dir if missing.
+            "id -u wf >/dev/null 2>&1 || useradd -m -d /home/wf -s /bin/bash wf; "
+            "mkdir -p /home/wf/.steam; "
+            # Wipe stale sdk symlink targets so `ln -sf` can recreate them.
+            "for p in /home/wf/.steam/sdk64 /home/wf/.steam/sdk32; do "
+            "  if [ -e \"$p\" ] && [ ! -L \"$p\" ]; then rm -rf \"$p\"; fi; "
+            "done; "
+            "chown -R wf:wf /home/wf; "
+            "mkdir -p /app/Steam /app/server /app/scripts; "
+            # If provision already populated /app/Steam or /app/server as root,
+            # re-chown so the wf user can read the SteamCMD layout (including
+            # the linux32/linux64 symlinks) and write game data.
+            "for d in /app/Steam /app/server; do "
+            "  if [ -d \"$d\" ]; then chown -R wf:wf \"$d\"; fi; "
+            "done; "
+        )
+        _run(client, cmd, timeout=120)
+        print(f"[{host}] Bootstrap complete ✓")
+    finally:
+        client.close()
+
+
+# ---------------------------------------------------------------------------
 # Setup step  (runs once per host)
 # ---------------------------------------------------------------------------
 
