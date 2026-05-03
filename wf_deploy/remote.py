@@ -396,10 +396,17 @@ def start_instance(
 
     # Launcher body — written verbatim via a quoted heredoc so wf_params
     # (which can contain spaces and double quotes) survives shell expansion.
+    # Supervises the binary: if it exits for any reason, log it and relaunch
+    # after a short backoff so a crash doesn't take the session down. To stop
+    # the server, kill the tmux session — that takes the supervisor with it.
     launcher = (
         "#!/bin/bash\n"
         f"cd {APP_SERVER_DIR}\n"
-        f"exec ./{WF_BINARY} {wf_params} 2>&1 | tee -a {log}\n"
+        "while true; do\n"
+        f"    ./{WF_BINARY} {wf_params} 2>&1 | tee -a {log}\n"
+        f'    echo "[supervisor] {WF_BINARY} exited $?, restarting in 5s" | tee -a {log}\n'
+        "    sleep 5\n"
+        "done\n"
     )
 
     script = f"""\
