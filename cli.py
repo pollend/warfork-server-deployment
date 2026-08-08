@@ -37,6 +37,7 @@ from wf_deploy import remote
 
 DEFAULT_CONFIG = Path(__file__).parent / "server-management" / "server-config.json"
 DEFAULT_SCRIPTS_DIR = Path(__file__).parent / "server-management"
+DEFAULT_MAPS_DIR = Path(__file__).parent / "server-management" / "downloads"
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +87,33 @@ def _common_options(f):
         help='Comma-separated server-type keys, or "all".',
     )(f)
     return f
+
+
+def _maps_dir_option(f):
+    """Local directory of custom .pk3/.pak archives pushed into basewf."""
+    f = click.option(
+        "--maps-dir",
+        default=str(DEFAULT_MAPS_DIR),
+        show_default=True,
+        type=click.Path(file_okay=False),
+        help=(
+            "Local directory of custom map archives (*.pk3/*.pak) to rsync into "
+            "/app/server/basewf. Pass --no-maps to skip."
+        ),
+    )(f)
+    f = click.option(
+        "--no-maps",
+        is_flag=True,
+        help="Don't upload custom maps, even if the maps directory exists.",
+    )(f)
+    return f
+
+
+def _resolve_maps_dir(maps_dir: str, no_maps: bool) -> Path | None:
+    if no_maps:
+        return None
+    path = Path(maps_dir)
+    return path if path.is_dir() else None
 
 
 def _ssh_key_option(f):
@@ -163,6 +191,7 @@ def cmd_matrix(config, regions, types, branch, as_json):
 @cli.command("deploy")
 @_common_options
 @_ssh_key_option
+@_maps_dir_option
 @click.option(
     "--scripts-dir",
     default=str(DEFAULT_SCRIPTS_DIR),
@@ -204,7 +233,7 @@ def cmd_matrix(config, regions, types, branch, as_json):
     help="Print what would happen without connecting to any server.",
 )
 def cmd_deploy(
-    config, regions, types, ssh_key,
+    config, regions, types, ssh_key, maps_dir, no_maps,
     scripts_dir, parallel, rcon_password, operator_password, local_build, dry_run,
 ):
     """Update game files via SteamCMD, refresh configs, and restart all
@@ -235,8 +264,13 @@ def cmd_deploy(
         _resolve_host_branches(server_entries)
     )
     scripts_path = Path(scripts_dir)
+    maps_path = _resolve_maps_dir(maps_dir, no_maps)
     source_label = (
         f"local build {local_build_path}" if local_build_path else "Steam branch (per host)"
+    )
+    maps_label = (
+        f"{len(list(maps_path.glob('*.pk3')))} pk3 from {maps_path}"
+        if maps_path else "none"
     )
 
     # ── Summary ──────────────────────────────────────────────────────────
@@ -245,6 +279,7 @@ def cmd_deploy(
     click.echo(f"  Regions : {regions}")
     click.echo(f"  Types   : {types}")
     click.echo(f"  Source  : {source_label}")
+    click.echo(f"  Maps    : {maps_label}")
     click.echo(f"  Jobs    : {len(entries)} across {len(server_entries)} server(s)")
     click.echo(f"  Dry run : {dry_run}")
     click.echo(f"{'='*60}\n")
@@ -280,6 +315,7 @@ def cmd_deploy(
             scripts_dir=scripts_path,
             steam_branch=host_branch[se.host],
             local_build=local_build_path,
+            maps_dir=maps_path,
         )
         click.echo(f"  [{se.region_label}] Host ready ✓")
 
@@ -353,6 +389,7 @@ def cmd_deploy(
 @cli.command("bootstrap")
 @_common_options
 @_ssh_key_option
+@_maps_dir_option
 @click.option(
     "--root-user", "-u",
     default="root",
@@ -383,7 +420,8 @@ def cmd_deploy(
     ),
 )
 def cmd_bootstrap(
-    config, regions, types, ssh_key, root_user, scripts_dir, parallel, local_build,
+    config, regions, types, ssh_key, maps_dir, no_maps,
+    root_user, scripts_dir, parallel, local_build,
 ):
     """Log in as root and perform full first-time setup for each host.
 
@@ -412,6 +450,7 @@ def cmd_bootstrap(
         _resolve_host_branches(server_entries)
     )
     scripts_path = Path(scripts_dir)
+    maps_path = _resolve_maps_dir(maps_dir, no_maps)
 
     source_label = (
         f"local build {local_build_path}" if local_build_path else "Steam branch (per host)"
@@ -419,6 +458,7 @@ def cmd_bootstrap(
     click.echo(f"\n{'='*60}")
     click.echo(f"  Bootstrapping {len(server_entries)} host(s) as {root_user!r}")
     click.echo(f"  Source : {source_label}")
+    click.echo(f"  Maps   : {maps_path or 'none'}")
     click.echo(f"{'='*60}\n")
 
     failures: list[str] = []
@@ -434,6 +474,7 @@ def cmd_bootstrap(
             scripts_dir=scripts_path,
             steam_branch=branch,
             local_build=local_build_path,
+            maps_dir=maps_path,
         )
         click.echo(f"  [{se.region_label}] Ready ✓")
 
@@ -460,6 +501,142 @@ def cmd_bootstrap(
     else:
         click.echo(click.style("  All done ✓", fg="green"))
     click.echo(f"{'='*60}\n")
+
+
+# ---------------------------------------------------------------------------
+# maps command
+# ---------------------------------------------------------------------------
+
+@cli.command("maps")
+@_common_options
+@_ssh_key_option
+@_maps_dir_option
+@click.option(
+    "--parallel", "-p",
+    default=4,
+    show_default=True,
+    type=click.IntRange(1, 16),
+    help="Maximum concurrent SSH connections.",
+)
+@click.option(
+    "--restart",
+    is_flag=True,
+    help="Restart the selected sessions afterwards so the new maps enter the pure list.",
+)
+@click.option(
+    "--rcon-password",
+    default=lambda: os.environ.get("RCON_PASSWORD", ""),
+    show_default="$RCON_PASSWORD",
+    help="rcon_password injected into server params on restart.",
+)
+@click.option(
+    "--operator-password",
+    default=lambda: os.environ.get("OPERATOR_PASSWORD", ""),
+    show_default="$OPERATOR_PASSWORD",
+    help="g_operator_password injected into server params on restart.",
+)
+def cmd_maps(config, regions, types, ssh_key, maps_dir, no_maps, parallel,
+             restart, rcon_password, operator_password):
+    """Push custom map archives to /app/server/basewf without a SteamCMD run.
+
+    Running servers keep serving the pure list they built at startup, so newly
+    uploaded maps stay invisible to clients until the session restarts. Pass
+    --restart to stop and start the selected sessions in one go.
+    """
+    if not ssh_key:
+        raise click.ClickException(
+            "SSH private key is required. Use --ssh-key or set $WF_SSH_KEY."
+        )
+
+    maps_path = _resolve_maps_dir(maps_dir, no_maps)
+    if not maps_path:
+        raise click.ClickException(
+            f"No maps directory at {maps_dir} (or --no-maps was passed)."
+        )
+
+    server_config = cfg_mod.load(config)
+    try:
+        entries, server_entries = matrix_mod.build(server_config, regions, types)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+
+    archives = sorted(
+        p.name for p in maps_path.iterdir()
+        if p.is_file() and p.suffix.lower() in (".pk3", ".pak")
+    )
+    click.echo(
+        f"\nPushing {len(archives)} archive(s) from {maps_path} "
+        f"to {len(server_entries)} host(s)\n"
+    )
+
+    failures: list[str] = []
+
+    def _push(se):
+        remote.upload_maps(
+            host=se.host,
+            username=se.username,
+            ssh_key=ssh_key,
+            maps_dir=maps_path,
+        )
+        click.echo(f"  [{se.region_label}] Maps uploaded ✓")
+
+    with ThreadPoolExecutor(max_workers=parallel) as pool:
+        futures = {pool.submit(_push, se): se for se in server_entries}
+        for fut in as_completed(futures):
+            se = futures[fut]
+            exc = fut.exception()
+            if exc:
+                failures.append(se.region_label)
+                click.echo(
+                    click.style(f"  [{se.region_label}] UPLOAD FAILED: {exc}", fg="red"),
+                    err=True,
+                )
+
+    if failures:
+        sys.exit(1)
+
+    if not restart:
+        click.echo(
+            "\nMaps uploaded. Restart the sessions "
+            "(`cli.py maps --restart`, or stop + deploy) before clients can see them.\n"
+        )
+        return
+
+    click.echo(f"\nRestarting {len(entries)} session(s) …\n")
+
+    def _restart(entry):
+        label = f"{entry.region_label} / {entry.type_label}"
+        wf_params = remote.resolve_wf_params(
+            entry.wf_params, entry.region_label,
+            rcon_password=rcon_password,
+            operator_password=operator_password,
+        )
+        remote.stop_instance(
+            host=entry.host, username=entry.username,
+            ssh_key=ssh_key, wf_params=wf_params,
+        )
+        remote.start_instance(
+            host=entry.host, username=entry.username,
+            ssh_key=ssh_key, wf_params=wf_params,
+        )
+        click.echo(f"  [{label}] Restarted ✓")
+
+    with ThreadPoolExecutor(max_workers=parallel) as pool:
+        futures = {pool.submit(_restart, e): e for e in entries}
+        for fut in as_completed(futures):
+            e = futures[fut]
+            label = f"{e.region_label} / {e.type_label}"
+            exc = fut.exception()
+            if exc:
+                failures.append(label)
+                click.echo(
+                    click.style(f"  [{label}] RESTART FAILED: {exc}", fg="red"),
+                    err=True,
+                )
+
+    if failures:
+        sys.exit(1)
+    click.echo(click.style("\n  All done ✓\n", fg="green"))
 
 
 # ---------------------------------------------------------------------------

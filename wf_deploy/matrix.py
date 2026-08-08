@@ -10,6 +10,9 @@ from typing import Any
 
 from .config import ServerConfig
 
+# Added to a server type's game port to get its HTTP download port.
+HTTP_PORT_OFFSET = 100
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -127,11 +130,16 @@ def build(
             st = srv.configuration[stype]
 
             # Merge: defaults ← type cvars ← port
+            # sv_http_port serves map downloads over HTTP and must be unique
+            # per instance — several server types share one host, so derive it
+            # from the game port (44401 -> 44501) instead of the single value
+            # in _base.cfg, which every instance would otherwise fight over.
             merged: dict[str, Any] = {
                 **default_cvars,
                 **st.cvars,
                 "sv_port": st.port,
                 "sv_port6": st.port,
+                "sv_http_port": st.port + HTTP_PORT_OFFSET,
             }
 
             cvar_str = _cvars_to_params(merged)

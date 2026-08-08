@@ -60,6 +60,7 @@ server-management/
     votable.cfg
     instagib.cfg
     race.cfg
+  downloads/            Custom map archives (*.pk3) pushed into /app/server/basewf
 ```
 
 All server-side logic (bootstrap, deploy, stop, status) lives in
@@ -82,7 +83,8 @@ Since `+set` on the command line always wins over `set` in a cfg file, the value
 | Setting | Where it lives |
 | --------- | --------------- |
 | `net_port`, `g_gametype`, `sv_hostname`, `sv_maxclients`, `dedicated` | `server-config.json` |
-| `sv_defaultmap`, `g_votable_gametypes`, per-type vote overrides | `configs/{type}.cfg` |
+| `sv_http_port` (derived as `port + 100`) | `wf_deploy/matrix.py` |
+| `sv_defaultmap`, `g_maplist`, `g_votable_gametypes`, per-type vote overrides | `configs/{type}.cfg` |
 | Logging, masterservers, HTTP, antilag, recording, vote defaults | `configs/_base.cfg` |
 | `rcon_password`, `g_operator_password` | GitHub secrets |
 
@@ -102,6 +104,34 @@ sessions again.
 Full first-time setup (packages, SteamCMD, game files) is handled by the
 `bootstrap` command — see the **First deploy** section above. Use the
 separate `stop` and `status` commands for read-only or maintenance ops.
+
+## Custom maps
+
+Drop `.pk3` archives into `server-management/downloads/`. `bootstrap` and
+`deploy` rsync them into `/app/server/basewf/` on every selected host; the
+standalone `maps` command pushes them without a SteamCMD run:
+
+```bash
+pipenv run python cli.py maps -r US -t votable --restart --ssh-key ~/.ssh/id_ed25519
+pipenv run python cli.py deploy -r US --no-maps --ssh-key ~/.ssh/id_ed25519   # skip maps
+```
+
+Clients pull missing archives over the server's built-in HTTP server
+(`sv_http 1` in `_base.cfg`). Two things must hold for that to work:
+
+* **The HTTP port must be reachable.** Each instance listens on its game port
+  plus 100 — `44401` → `44501`, `44403` → `44503`, etc. — so open TCP
+  `44501-44599` in the host firewall alongside the UDP game ports. The single
+  `sv_http_port` in `_base.cfg` is only a fallback; the per-instance value is
+  injected via `+set` by `matrix.py`, because several server types share one
+  host and would otherwise all try to bind the same port.
+* **The server must be restarted after uploading.** `sv_pure 1` builds its pure
+  list at process start, and clients can only download archives on that list.
+  `deploy` and `maps --restart` handle this; a bare `maps` push does not.
+
+Add the map's **bsp name** (not the archive filename) to `g_maplist` in the
+relevant `configs/*.cfg` so it enters rotation and map votes. See
+[`downloads/README.md`](downloads/README.md) for the current inventory.
 
 ## Adding a server type
 
@@ -171,6 +201,7 @@ pipenv run python cli.py status -r US -t clan-arena --ssh-key ~/.ssh/id_ed25519
 pipenv run python cli.py stop   -r US -t clan-arena --ssh-key ~/.ssh/id_ed25519
 pipenv run python cli.py deploy -r US -t clan-arena --ssh-key ~/.ssh/id_ed25519
 pipenv run python cli.py logs   -r US                --ssh-key ~/.ssh/id_ed25519
+pipenv run python cli.py maps   -r US --restart      --ssh-key ~/.ssh/id_ed25519
 ```
 
 If you do need to inspect a server directly, sessions are named by port

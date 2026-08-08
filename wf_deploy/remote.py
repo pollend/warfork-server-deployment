@@ -125,6 +125,73 @@ def upload_directory(host: str, username: str, ssh_key: str,
         client.close()
 
 
+def _rsync(sources: list[str], host: str, username: str, ssh_key: str,
+           remote_dir: str, extra_flags: list[str] | None = None) -> None:
+    """Rsync *sources* into *remote_dir* on the host over SSH."""
+    ssh_cmd = (
+        f"ssh -i {shlex.quote(ssh_key)} "
+        f"-o StrictHostKeyChecking=no -o BatchMode=yes"
+    )
+    cmd = [
+        "rsync", "-a", "--info=progress2",
+        *(extra_flags or []),
+        "-e", ssh_cmd,
+        *sources,
+        f"{username}@{host}:{remote_dir}/",
+    ]
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"rsync failed (exit {result.returncode}): "
+            f"{' '.join(shlex.quote(c) for c in cmd)}"
+        )
+
+
+def upload_maps(
+    host: str,
+    username: str,
+    ssh_key: str,
+    maps_dir: Path,
+    remote_dir: str = APP_WF_DIR,
+) -> None:
+    """Rsync every .pk3/.pak in *maps_dir* into /app/server/basewf on the host.
+
+    Only new or changed archives are transferred. Existing files in the remote
+    directory are never deleted, so the game's own paks are left alone. The
+    result is chowned to wf:wf since rsync writes as the SSH user.
+
+    Maps must be present before the server process starts: `sv_pure 1` builds
+    its pure list at startup, and clients can only download archives that are
+    on that list.
+    """
+    archives = sorted(
+        p for p in maps_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in (".pk3", ".pak")
+    )
+    if not archives:
+        print(f"[{host}] No .pk3/.pak files in {maps_dir}, skipping map upload")
+        return
+
+    print(f"\n[{host}] Uploading {len(archives)} map archive(s) -> {remote_dir}/ …")
+    for a in archives:
+        print(f"  - {a.name}")
+
+    client = _connect(host, username, ssh_key)
+    try:
+        _run(client, f"mkdir -p {remote_dir}", timeout=60)
+    finally:
+        client.close()
+
+    _rsync([str(a) for a in archives], host, username, ssh_key, remote_dir)
+
+    client = _connect(host, username, ssh_key)
+    try:
+        names = " ".join(shlex.quote(f"{remote_dir}/{a.name}") for a in archives)
+        _run(client, f"sudo chown {WF_USER}:{WF_USER} {names}", timeout=120)
+    finally:
+        client.close()
+
+
 def rsync_local_build(
     host: str,
     username: str,
@@ -184,6 +251,7 @@ def bootstrap_host(
     scripts_dir: Path,
     steam_branch: str | None = "public",
     local_build: Path | None = None,
+    maps_dir: Path | None = None,
 ) -> None:
     """
     Prepare a freshly-imaged host so that `wf` can run the game server.
@@ -202,7 +270,8 @@ def bootstrap_host(
       8. Sync optional /var/wf overrides into /app/server/basewf.
       9. Create configs dir + installed.lock marker.
      10. Upload local configs/*.cfg.
-     11. chown -R wf:wf on /home/wf and /app/{Steam,server}.
+     11. Upload custom map archives from *maps_dir* (skipped if unset).
+     12. chown -R wf:wf on /home/wf and /app/{Steam,server}.
 
     Idempotent — safe to re-run to recover a host or refresh game files.
     """
@@ -214,7 +283,7 @@ def bootstrap_host(
     print(f"\n[{host}] Bootstrapping host as {username} ({source_label}) …")
     client = _connect(host, username, ssh_key)
     try:
-        _step(client, host, "1/11 create wf user + home", """\
+        _step(client, host, "1/12 create wf user + home", """\
 set -e
 id -u wf >/dev/null 2>&1 || useradd -m -d /home/wf -s /bin/bash wf
 mkdir -p /home/wf/.steam
@@ -223,11 +292,11 @@ for p in /home/wf/.steam/sdk64 /home/wf/.steam/sdk32; do
 done
 """, timeout=60)
 
-        _step(client, host, "2/11 apt-get update",
+        _step(client, host, "2/12 apt-get update",
               "set -e\nexport DEBIAN_FRONTEND=noninteractive\napt-get update",
               timeout=300)
 
-        _step(client, host, "3/11 install system packages", """\
+        _step(client, host, "3/12 install system packages", """\
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get install -y --no-install-recommends \\
@@ -236,7 +305,7 @@ apt-get install -y --no-install-recommends \\
     libcurl4 libcurl3-gnutls locales
 """, timeout=900)
 
-        _step(client, host, "4/11 configure locales", """\
+        _step(client, host, "4/12 configure locales", """\
 set -e
 export DEBIAN_FRONTEND=noninteractive
 sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
@@ -244,11 +313,11 @@ dpkg-reconfigure --frontend=noninteractive locales
 rm -rf /var/lib/apt/lists/*
 """, timeout=120)
 
-        _step(client, host, "5/11 create /app layout",
+        _step(client, host, "5/12 create /app layout",
               f"set -e\nmkdir -p {APP_STEAM_DIR} {APP_SERVER_DIR} {APP_DIR}/.steam",
               timeout=30)
 
-        _step(client, host, "6/11 download SteamCMD (if missing)", f"""\
+        _step(client, host, "6/12 download SteamCMD (if missing)", f"""\
 set -e
 if [ ! -x {APP_STEAM_DIR}/steamcmd.sh ]; then
     cd {APP_STEAM_DIR}
@@ -260,18 +329,18 @@ fi
 """, timeout=300)
 
         if local_build:
-            _step(client, host, "7/11 prep /app/server for local build",
+            _step(client, host, "7/12 prep /app/server for local build",
                   f"set -e\nmkdir -p {APP_SERVER_DIR}", timeout=30)
-            print(f"\n[{host}] >>> 7/11 rsync local build")
+            print(f"\n[{host}] >>> 7/12 rsync local build")
             try:
                 rsync_local_build(host, username, ssh_key, local_build, APP_SERVER_DIR)
             except RuntimeError as exc:
                 raise RuntimeError(
-                    f"[{host}] step failed: 7/11 rsync local build\n{exc}"
+                    f"[{host}] step failed: 7/12 rsync local build\n{exc}"
                 ) from None
         else:
             app_args = _steam_app_args(steam_branch)
-            _step(client, host, f"7/11 fetch game files (branch={steam_branch})", f"""\
+            _step(client, host, f"7/12 fetch game files (branch={steam_branch})", f"""\
 set -e
 {APP_STEAM_DIR}/steamcmd.sh \\
     +force_install_dir {APP_SERVER_DIR} \\
@@ -280,7 +349,7 @@ set -e
     +quit
 """, timeout=1800)
 
-        _step(client, host, "8/11 sync /var/wf overrides (if any)", f"""\
+        _step(client, host, "8/12 sync /var/wf overrides (if any)", f"""\
 set -e
 if [ -d {WF_CUSTOM_CONFIGS_DIR} ]; then
     echo '> Syncing custom files from {WF_CUSTOM_CONFIGS_DIR}'
@@ -291,24 +360,35 @@ else
 fi
 """, timeout=120)
 
-        _step(client, host, "9/11 create configs dir + lock",
+        _step(client, host, "9/12 create configs dir + lock",
               f"set -e\nmkdir -p {APP_WF_DIR}/configs\ntouch {APP_INSTALLED_LOCK}",
               timeout=30)
 
         configs_dir = scripts_dir / "configs"
         if configs_dir.is_dir():
-            print(f"\n[{host}] >>> 10/11 upload configs from {configs_dir}")
+            print(f"\n[{host}] >>> 10/12 upload configs from {configs_dir}")
             try:
                 with SCPClient(client.get_transport()) as scp:
                     for cfg in configs_dir.glob("*.cfg"):
                         print(f"  - {cfg.name}")
                         scp.put(str(cfg), remote_path=f"{APP_WF_DIR}/configs/{cfg.name}")
             except Exception as exc:
-                raise RuntimeError(f"[{host}] step failed: 10/11 upload configs\n{exc}") from None
+                raise RuntimeError(f"[{host}] step failed: 10/12 upload configs\n{exc}") from None
         else:
-            print(f"\n[{host}] >>> 10/11 upload configs — skipped (no {configs_dir})")
+            print(f"\n[{host}] >>> 10/12 upload configs — skipped (no {configs_dir})")
 
-        _step(client, host, "11/11 chown -R wf:wf",
+        if maps_dir and maps_dir.is_dir():
+            print(f"\n[{host}] >>> 11/12 upload custom maps from {maps_dir}")
+            try:
+                upload_maps(host, username, ssh_key, maps_dir)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"[{host}] step failed: 11/12 upload custom maps\n{exc}"
+                ) from None
+        else:
+            print(f"\n[{host}] >>> 11/12 upload custom maps — skipped (no maps dir)")
+
+        _step(client, host, "12/12 chown -R wf:wf",
               f"chown -R wf:wf /home/wf {APP_STEAM_DIR} {APP_SERVER_DIR}",
               timeout=300)
 
@@ -328,6 +408,7 @@ def update_and_upload(
     scripts_dir: Path,         # local server-management/ folder
     steam_branch: str | None = None,
     local_build: Path | None = None,
+    maps_dir: Path | None = None,
 ) -> None:
     """Refresh game files and upload local configs.
 
@@ -376,6 +457,12 @@ echo '> Updating game files via SteamCMD (branch: {steam_branch})'
                 scp.put(str(cfg), remote_path=f"{APP_WF_DIR}/configs/{cfg.name}")
     finally:
         client.close()
+
+    # Maps go up last, while every session is still stopped — the pure list is
+    # built at server startup, so archives added after that are invisible to
+    # clients until the next restart.
+    if maps_dir and maps_dir.is_dir():
+        upload_maps(host, username, ssh_key, maps_dir)
 
 
 # ---------------------------------------------------------------------------

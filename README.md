@@ -29,6 +29,7 @@ Python dependencies (declared in `requirements.txt`, managed via pipenv):
 - `wf_deploy/remote.py`: SSH/SCP actions against remote hosts (bootstrap, lifecycle, log tailing — all logic lives here)
 - `server-management/server-config.json`: Server and game type definitions
 - `server-management/configs/*.cfg`: Warfork config files per game type
+- `server-management/downloads/*.pk3`: Custom map archives pushed into `/app/server/basewf`
 
 ## Setup
 
@@ -98,6 +99,7 @@ Top-level commands:
 - `stop`: Stop every selected tmux session
 - `status`: Report whether each selected session is running
 - `logs`: Tail `/home/wf/wf-*.log` from every selected host in one terminal
+- `maps`: Push custom `.pk3` archives to `/app/server/basewf` (optionally restarting sessions)
 
 General selectors shared by commands:
 - `--config, -c`: Path to config JSON
@@ -252,6 +254,31 @@ Stop every selected tmux session (no-op for sessions that aren't running):
 ```bash
 pipenv run python cli.py stop -r EU --ssh-key ~/.ssh/id_ed25519
 ```
+
+### 7) Custom maps
+
+Every `.pk3`/`.pak` in `server-management/downloads/` is rsynced into
+`/app/server/basewf/` by `bootstrap` and `deploy`. Only new or changed archives
+go over the wire, and nothing on the host is deleted, so the game's own paks
+are left alone. Use `--no-maps` to skip the upload, or `--maps-dir` to point at
+a different folder.
+
+To push maps without waiting on a SteamCMD run:
+
+```bash
+pipenv run python cli.py maps -r US -t votable --restart --ssh-key ~/.ssh/id_ed25519
+```
+
+`--restart` matters: `sv_pure 1` builds the downloadable-file list when the
+server process starts, so archives added to a running server stay invisible to
+clients until the session comes back.
+
+Clients fetch missing archives from the server's built-in HTTP server, which
+listens on the game port plus 100 (`44403` → `44503`). Those TCP ports must be
+open in the host firewall or downloads silently fall back to nothing.
+
+See [`server-management/downloads/README.md`](server-management/downloads/README.md)
+for the current map inventory and how to wire a new map into `g_maplist`.
 
 ## Typical Workflows
 
